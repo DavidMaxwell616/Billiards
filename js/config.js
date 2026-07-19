@@ -47,7 +47,7 @@ export const ballTypes = [
     {
         index: 9,
         color: "yellow",
-        type: "solid",
+        type: "stripe",
     },
     {
         index: 10,

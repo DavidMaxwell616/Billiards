@@ -1,4 +1,5 @@
 import { GameScene } from "./GameScene.js";
+import { SplashScene } from "./SplashScene.js";
 
 
 const config = {
@@ -17,7 +18,7 @@ const config = {
         mode: Phaser.Scale.RESIZE,
         autoCenter: Phaser.Scale.CENTER_BOTH
     },
-    scene: GameScene
+    scene: [SplashScene, GameScene]
 };
 
 new Phaser.Game(config);

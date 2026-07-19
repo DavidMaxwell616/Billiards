@@ -5,17 +5,42 @@ export class GameScene extends Phaser.Scene {
 
         this.ballRadius = 16;
         this.acceleration = 900;
-        this.maxSpeed = 540;
-        this.drag = 500;
+        this.maxSpeed = 1050;
+        this.tableFriction = .8;
+        this.ballStopSpeed = 5;
         this.restitution = 0.82;
         this.ballCollisionRestitution = 0.96;
+
+        this.cueTipPadding = 7;
+        this.maxCuePullback = 140;
+        this.maxShotSpeed = this.maxSpeed;
+        this.cueAngle = 0;
+        this.cuePullback = 0;
+        this.shotPower = 0;
+        this.cueState = "hidden";
+        this.cueStrikeTween = null;
 
         this.ballTextureSize = this.ballRadius * 2;
         this.balls = [];
         this.rackOrder = [];
         this.selectedBall = null;
-        this.score = 0;
         this.rerackPending = false;
+        this.isScratchSequence = false;
+        this.scratchTween = null;
+
+        this.players = {
+            player: { name: "PLAYER", group: null, score: 0 },
+            computer: { name: "COMPUTER", group: null, score: 0 }
+        };
+        this.currentTurn = "player";
+        this.shotInProgress = false;
+        this.shotPocketed = [];
+        this.cueBallScratched = false;
+        this.firstContactBall = null;
+        this.gameOver = false;
+        this.aiShotTimer = null;
+        this.gameOverPhase = null;
+        this.gameOverTimers = [];
     }
 
     preload() {
@@ -34,6 +59,7 @@ export class GameScene extends Phaser.Scene {
         this.createTextures();
         this.createArena();
         this.createBalls();
+        this.createCueStick();
         this.createControls();
         this.createHud();
 
@@ -60,6 +86,7 @@ export class GameScene extends Phaser.Scene {
                 surfaceX: 0,
                 surfaceY: 0
             };
+            this.randomizeBallOrientation(ballState);
             this.balls.push(ballState);
             this.redrawBallTexture(ballState);
         }
@@ -158,6 +185,32 @@ export class GameScene extends Phaser.Scene {
 
         hctx.restore();
         shine.refresh();
+    }
+
+    randomizeBallOrientation(ballState) {
+        // Shoemake's method produces an even random rotation over a sphere.
+        const u1 = Math.random();
+        const u2 = Math.random();
+        const u3 = Math.random();
+        const qx = Math.sqrt(1 - u1) * Math.sin(Math.PI * 2 * u2);
+        const qy = Math.sqrt(1 - u1) * Math.cos(Math.PI * 2 * u2);
+        const qz = Math.sqrt(u1) * Math.sin(Math.PI * 2 * u3);
+        const qw = Math.sqrt(u1) * Math.cos(Math.PI * 2 * u3);
+        const rotate = vector => {
+            const dot = qx * vector.x + qy * vector.y + qz * vector.z;
+            const crossX = qy * vector.z - qz * vector.y;
+            const crossY = qz * vector.x - qx * vector.z;
+            const crossZ = qx * vector.y - qy * vector.x;
+
+            return {
+                x: 2 * dot * qx + (2 * qw * qw - 1) * vector.x + 2 * qw * crossX,
+                y: 2 * dot * qy + (2 * qw * qw - 1) * vector.y + 2 * qw * crossY,
+                z: 2 * dot * qz + (2 * qw * qw - 1) * vector.z + 2 * qw * crossZ
+            };
+        };
+
+        ballState.spotVector = rotate({ x: 0, y: 0, z: 1 });
+        ballState.stripeNormal = rotate({ x: 0, y: 1, z: 0 });
     }
 
 
@@ -559,6 +612,8 @@ export class GameScene extends Phaser.Scene {
 
     createBallGameObjects(ballState, position, bounds) {
         ballState.pocketed = false;
+        ballState.pocketing = false;
+        ballState.pocketTween = null;
         ballState.shadow = this.add.image(
             position.x + this.ballRadius * 0.217,
             position.y + this.ballRadius * 0.37,
@@ -660,6 +715,16 @@ export class GameScene extends Phaser.Scene {
     }
 
     applyCollisionMomentum(firstBall, secondBall) {
+        if (this.shotInProgress && this.firstContactBall === null) {
+            const firstState = this.balls.find(candidate => candidate.image === firstBall);
+            const secondState = this.balls.find(candidate => candidate.image === secondBall);
+            if (firstState?.type.index === 0 && secondState?.type.index !== 0) {
+                this.firstContactBall = secondState.type.index;
+            } else if (secondState?.type.index === 0 && firstState?.type.index !== 0) {
+                this.firstContactBall = firstState.type.index;
+            }
+        }
+
         const collision = this.pendingCollisionMomentum;
         if (!collision) return;
 
@@ -680,31 +745,84 @@ export class GameScene extends Phaser.Scene {
         this.pendingCollisionMomentum = null;
     }
 
-    pocketBall(ballImage) {
+    pocketBall(ballImage, hole) {
         const ballState = this.balls.find(candidate => candidate.image === ballImage);
-        if (!ballState || ballState.pocketed) return;
+        if (!ballState || !hole || ballState.pocketed || ballState.pocketing) return;
+
+        ballState.pocketing = true;
+        this.resetCueStick();
+        ballImage.setVelocity(0, 0);
+        ballImage.setAcceleration(0, 0);
+        ballImage.body.enable = false;
+
+        const visualLayers = [ballState.shadow, ballImage, ballState.shine];
+        ballState.pocketTween = this.tweens.chain({
+            tweens: [
+                {
+                    targets: visualLayers,
+                    x: hole.x,
+                    y: hole.y,
+                    scaleX: 0.72,
+                    scaleY: 0.72,
+                    duration: 160,
+                    ease: "Sine.easeIn"
+                },
+                {
+                    targets: visualLayers,
+                    x: hole.x,
+                    y: hole.y,
+                    scaleX: 0.08,
+                    scaleY: 0.08,
+                    alpha: 0,
+                    duration: 220,
+                    ease: "Quad.easeIn",
+                    onComplete: () => {
+                        // Resolve the live center again in case the table resized.
+                        visualLayers.forEach(layer => layer.setPosition(hole.x, hole.y));
+                        ballState.pocketTween = null;
+                        this.finishPocketingBall(ballState);
+                    }
+                }
+            ]
+        });
+    }
+
+    finishPocketingBall(ballState) {
+        const ballImage = ballState.image;
+        if (!ballImage || !ballState.pocketing) return;
 
         if (ballState.type.index === 0) {
+            if (this.shotInProgress) this.cueBallScratched = true;
             const footSpot = this.getFootSpotPosition();
-            ballImage.setPosition(footSpot.x, footSpot.y);
-            ballImage.setVelocity(0, 0);
-            ballImage.setAcceleration(0, 0);
+            ballState.pocketing = false;
+            ballImage
+                .setScale(1)
+                .setAlpha(1)
+                .setPosition(footSpot.x, footSpot.y);
+            ballState.shadow
+                .setScale(1)
+                .setAlpha(1)
+                .setPosition(
+                    footSpot.x + this.ballRadius * 0.217,
+                    footSpot.y + this.ballRadius * 0.37
+                );
+            ballState.shine
+                .setScale(1)
+                .setAlpha(1)
+                .setPosition(footSpot.x, footSpot.y);
+            ballImage.body.enable = true;
             ballImage.body.reset(footSpot.x, footSpot.y);
-            ballState.spotVector = { x: 0, y: 0, z: 1 };
-            ballState.stripeNormal = { x: 0, y: 1, z: 0 };
+            ballImage.setCollideWorldBounds(true, this.restitution, this.restitution);
+            this.randomizeBallOrientation(ballState);
             ballState.rotationScale = 1;
             ballState.rotationPause = 0;
             ballState.surfaceX = 0;
             ballState.surfaceY = 0;
-            ballState.shadow.setPosition(
-                footSpot.x + this.ballRadius * 0.217,
-                footSpot.y + this.ballRadius * 0.37
-            );
-            ballState.shine.setPosition(footSpot.x, footSpot.y);
             this.redrawBallTexture(ballState);
             return;
         }
 
+        ballState.pocketing = false;
         ballState.pocketed = true;
         ballState.shadow.destroy();
         ballState.shine.destroy();
@@ -713,24 +831,65 @@ export class GameScene extends Phaser.Scene {
         ballState.shadow = null;
         ballState.shine = null;
 
-        this.score += 1;
-        this.scoreText?.setText(`Score: ${this.score}`);
-
-        this.rerackPending = this.balls
-            .filter(candidate => candidate.type.index !== 0)
-            .every(candidate => candidate.pocketed);
+        if (this.shotInProgress) this.recordPocketedBall(ballState.type.index);
 
         if (this.selectedBall === ballState) {
             this.selectedBall = this.balls.find(candidate => !candidate.pocketed)
                 || null;
         }
+
+    }
+
+    cancelPocketingAnimation(ballState) {
+        if (ballState.pocketTween) {
+            ballState.pocketTween.stop();
+            ballState.pocketTween = null;
+        }
+        if (!ballState.image) return;
+
+        ballState.pocketing = false;
+        ballState.image.body.enable = true;
+        [ballState.shadow, ballState.image, ballState.shine].forEach(layer => {
+            layer?.setScale(1).setAlpha(1);
+        });
+    }
+
+    startScratchSequence() {
+        if (this.isScratchSequence) return;
+
+        this.isScratchSequence = true;
+        this.resetCueStick();
+        this.balls.forEach(ballState => {
+            if (!ballState.image) return;
+            ballState.image.setVelocity(0, 0);
+            ballState.image.setAcceleration(0, 0);
+        });
+
+        this.scratchText
+            .setPosition(this.scale.width / 2, this.scale.height / 2)
+            .setVisible(true)
+            .setAlpha(0);
+        this.scratchTween = this.tweens.add({
+            targets: this.scratchText,
+            alpha: 1,
+            duration: 250,
+            yoyo: true,
+            repeat: 4,
+            onComplete: () => {
+                this.scratchText.setVisible(false).setAlpha(0);
+                this.scratchTween = null;
+                this.isScratchSequence = false;
+                this.rerackObjectBalls();
+            }
+        });
     }
 
     checkHoleCollisions() {
+        if (this.isScratchSequence) return;
         const lipTolerance = this.ballRadius * 0.3;
 
         for (const ballState of this.balls) {
-            if (ballState.pocketed || !ballState.image) continue;
+            if (ballState.pocketed || ballState.pocketing || !ballState.image) continue;
 
             for (const hole of this.holes) {
                 const captureDistance = hole.radius
@@ -742,6 +901,7 @@ export class GameScene extends Phaser.Scene {
 
                 if (distanceSquared <= captureDistance * captureDistance) {
                     this.pocketBall(ballState.image, hole);
+                    if (this.isScratchSequence) return;
                     break;
                 }
             }
@@ -749,8 +909,29 @@ export class GameScene extends Phaser.Scene {
     }
 
     rerackObjectBalls() {
+        this.resetCueStick();
         this.randomizeRackOrder();
         const bounds = this.getTableBounds();
+        const cueBall = this.balls.find(ballState => ballState.type.index === 0);
+        const footSpot = this.getFootSpotPosition();
+
+        if (cueBall?.image) {
+            cueBall.image.setPosition(footSpot.x, footSpot.y);
+            cueBall.image.setVelocity(0, 0);
+            cueBall.image.setAcceleration(0, 0);
+            cueBall.image.body.reset(footSpot.x, footSpot.y);
+            this.randomizeBallOrientation(cueBall);
+            cueBall.rotationScale = 1;
+            cueBall.rotationPause = 0;
+            cueBall.surfaceX = 0;
+            cueBall.surfaceY = 0;
+            cueBall.shadow.setPosition(
+                footSpot.x + this.ballRadius * 0.217,
+                footSpot.y + this.ballRadius * 0.37
+            );
+            cueBall.shine.setPosition(footSpot.x, footSpot.y);
+            this.redrawBallTexture(cueBall);
+        }
 
         this.balls.forEach(ballState => {
             if (ballState.type.index === 0) return;
@@ -762,10 +943,11 @@ export class GameScene extends Phaser.Scene {
                 ballState.image.setPosition(position.x, position.y);
                 ballState.image.setVelocity(0, 0);
                 ballState.image.setAcceleration(0, 0);
+                ballState.image.body.enable = true;
+                ballState.image.body.reset(position.x, position.y);
             }
 
-            ballState.spotVector = { x: 0, y: 0, z: 1 };
-            ballState.stripeNormal = { x: 0, y: 1, z: 0 };
+            this.randomizeBallOrientation(ballState);
             ballState.rotationScale = 1;
             ballState.rotationPause = 0;
             ballState.surfaceX = 0;
@@ -777,10 +959,26 @@ export class GameScene extends Phaser.Scene {
     }
 
     resetBalls() {
+        this.resetCueStick();
+        this.gameOverTimers.forEach(timer => timer.remove(false));
+        this.gameOverTimers = [];
+        this.gameOverPhase = null;
+        if (this.aiShotTimer) {
+            this.aiShotTimer.remove(false);
+            this.aiShotTimer = null;
+        }
+        if (this.scratchTween) {
+            this.scratchTween.stop();
+            this.scratchTween = null;
+        }
+        this.isScratchSequence = false;
+        this.gameOver = false;
+        this.scratchText?.setText("SCRATCH").setVisible(false).setAlpha(0);
         this.randomizeRackOrder();
         const bounds = this.getTableBounds();
 
         this.balls.forEach(ballState => {
+            this.cancelPocketingAnimation(ballState);
             const position = this.getBallStartPosition(ballState.type.index);
 
             if (!ballState.image) {
@@ -789,10 +987,11 @@ export class GameScene extends Phaser.Scene {
                 ballState.image.setPosition(position.x, position.y);
                 ballState.image.setVelocity(0, 0);
                 ballState.image.setAcceleration(0, 0);
+                ballState.image.body.enable = true;
+                ballState.image.body.reset(position.x, position.y);
             }
 
-            ballState.spotVector = { x: 0, y: 0, z: 1 };
-            ballState.stripeNormal = { x: 0, y: 1, z: 0 };
+            this.randomizeBallOrientation(ballState);
             ballState.rotationScale = 1;
             ballState.rotationPause = 0;
             ballState.surfaceX = 0;
@@ -800,9 +999,17 @@ export class GameScene extends Phaser.Scene {
             this.redrawBallTexture(ballState);
         });
 
-        this.score = 0;
+        this.players.player.group = null;
+        this.players.player.score = 0;
+        this.players.computer.group = null;
+        this.players.computer.score = 0;
+        this.currentTurn = "player";
+        this.shotInProgress = false;
+        this.shotPocketed = [];
+        this.cueBallScratched = false;
+        this.firstContactBall = null;
         this.rerackPending = false;
-        this.scoreText?.setText("Score: 0");
+        this.updateScoreHud();
         this.selectedBall = this.balls[0];
     }
 
@@ -814,141 +1021,733 @@ export class GameScene extends Phaser.Scene {
         }
     }
 
-    createControls() {
-        this.cursors = this.input.keyboard.createCursorKeys();
-        this.keys = this.input.keyboard.addKeys({
-            W: Phaser.Input.Keyboard.KeyCodes.W,
-            A: Phaser.Input.Keyboard.KeyCodes.A,
-            S: Phaser.Input.Keyboard.KeyCodes.S,
-            D: Phaser.Input.Keyboard.KeyCodes.D,
-            SPACE: Phaser.Input.Keyboard.KeyCodes.SPACE,
-            R: Phaser.Input.Keyboard.KeyCodes.R
+    getCueBall() {
+        return this.balls.find(ballState => ballState.type.index === 0);
+    }
+
+    getBallGroup(ballIndex) {
+        if (ballIndex >= 1 && ballIndex <= 7) return "solid";
+        if (ballIndex >= 9 && ballIndex <= 15) return "stripe";
+        return null;
+    }
+
+    getOpponent(turn = this.currentTurn) {
+        return turn === "player" ? "computer" : "player";
+    }
+
+    beginTrackedShot() {
+        this.shotInProgress = true;
+        this.shotPocketed = [];
+        this.cueBallScratched = false;
+        this.firstContactBall = null;
+    }
+
+    recordPocketedBall(ballIndex) {
+        this.shotPocketed.push(ballIndex);
+        if (ballIndex === 8) return;
+
+        const group = this.getBallGroup(ballIndex);
+        const shooter = this.players[this.currentTurn];
+        const opponent = this.players[this.getOpponent()];
+        if (!shooter.group && group) {
+            shooter.group = group;
+            opponent.group = group === "solid" ? "stripe" : "solid";
+        }
+
+        const ownerKey = Object.keys(this.players).find(
+            key => this.players[key].group === group
+        );
+        if (ownerKey) this.players[ownerKey].score += 1;
+        this.updateScoreHud();
+    }
+
+    resolveCompletedShot() {
+        const shooterKey = this.currentTurn;
+        const opponentKey = this.getOpponent(shooterKey);
+        const shooter = this.players[shooterKey];
+        const legalFirstContact = shooter.group
+            ? shooter.score >= 7
+                ? this.firstContactBall === 8
+                : this.getBallGroup(this.firstContactBall) === shooter.group
+            : this.firstContactBall !== null && this.firstContactBall !== 8;
+
+        if (this.shotPocketed.includes(8)) {
+            const legalEight = shooter.group
+                && shooter.score >= 7
+                && legalFirstContact
+                && !this.cueBallScratched;
+            this.endGame(legalEight ? shooterKey : opponentKey);
+            return;
+        }
+
+        const pocketedOwnBall = this.shotPocketed.some(
+            index => this.getBallGroup(index) === shooter.group
+        );
+        if (this.cueBallScratched || !legalFirstContact || !pocketedOwnBall) {
+            this.currentTurn = opponentKey;
+        }
+
+        this.shotInProgress = false;
+        this.shotPocketed = [];
+        this.cueBallScratched = false;
+        this.firstContactBall = null;
+        this.updateScoreHud();
+    }
+
+    endGame(winnerKey) {
+        this.gameOver = true;
+        this.gameOverPhase = "winner";
+        this.shotInProgress = false;
+        if (this.aiShotTimer) {
+            this.aiShotTimer.remove(false);
+            this.aiShotTimer = null;
+        }
+        this.resetCueStick();
+        this.balls.forEach(ballState => {
+            if (!ballState.image?.body?.enable) return;
+            ballState.image.setVelocity(0, 0).setAcceleration(0, 0);
         });
+        this.scratchText
+            .setText(`${this.players[winnerKey].name} WINS`)
+            .setFontSize(Phaser.Math.Clamp(this.scale.width * 0.063, 48, 96))
+            .setPosition(this.scale.width / 2, this.scale.height / 2)
+            .setVisible(true)
+            .setAlpha(1);
+        const gameOverTimer = this.time.delayedCall(5000, () => {
+            this.gameOverPhase = "game-over";
+            this.scratchText
+                .setText("GAME OVER")
+                .setFontSize(Phaser.Math.Clamp(this.scale.width * 0.063, 48, 96));
+        });
+        const restartTimer = this.time.delayedCall(10000, () => {
+            this.gameOverPhase = "restart";
+            this.scratchText
+                .setText("PRESS R TO RE-RACK")
+                .setFontSize(Phaser.Math.Clamp(this.scale.width * 0.045, 32, 64));
+        });
+        this.gameOverTimers = [gameOverTimer, restartTimer];
+        this.updateScoreHud();
+    }
 
-        this.input.on("pointerdown", pointer => {
-            const clickedBall = this.balls.find(ballState =>
-                !ballState.pocketed &&
-                Phaser.Math.Distance.Between(
-                    pointer.worldX,
-                    pointer.worldY,
-                    ballState.image.x,
-                    ballState.image.y
-                ) <= this.ballRadius
+    areBallsStopped() {
+        return this.balls.every(ballState =>
+            !ballState.pocketing
+            && (!ballState.image || ballState.image.body.velocity.lengthSq() < 9)
+        );
+    }
+
+    applyTableFriction(ballState, dt) {
+        const velocity = ballState.image.body.velocity;
+        const speed = velocity.length();
+        if (speed === 0) return;
+
+        // Proportional resistance preserves small collision impulses in a
+        // packed rack instead of subtracting the impulse away in one frame.
+        const nextSpeed = speed * Math.exp(-this.tableFriction * dt);
+        if (nextSpeed <= this.ballStopSpeed) {
+            ballState.image.setVelocity(0, 0);
+            return;
+        }
+
+        velocity.scale(nextSpeed / speed);
+    }
+
+    createCueStick() {
+        this.trajectoryGuide = this.add.graphics()
+            .setDepth(1.5)
+            .setVisible(false);
+        this.cueStick = this.add.image(0, 0, "cue stick")
+            // The source artwork points right, so its right edge is the tip.
+            .setOrigin(1, 0.5)
+            .setDepth(4)
+            .setVisible(false);
+        this.layoutCueStick();
+    }
+
+    layoutCueStick() {
+        if (!this.cueStick) return;
+
+        const width = Phaser.Math.Clamp(this.scale.width * 0.34, 330, 520);
+        const aspectRatio = this.cueStick.texture.getSourceImage().height
+            / this.cueStick.texture.getSourceImage().width;
+        this.cueStick.setDisplaySize(width, width * aspectRatio);
+    }
+
+    updateCueAngle(pointer = this.input.activePointer) {
+        const cueBall = this.getCueBall();
+        if (!cueBall?.image || this.cueState !== "aiming") return;
+
+        const deltaX = pointer.worldX - cueBall.image.x;
+        const deltaY = pointer.worldY - cueBall.image.y;
+        if (deltaX !== 0 || deltaY !== 0) {
+            this.cueAngle = Math.atan2(deltaY, deltaX);
+        }
+    }
+
+    renderCueStick() {
+        const cueBall = this.getCueBall();
+        if (!cueBall?.image || !this.cueStick?.visible) return;
+
+        const minimumDistance = this.ballRadius + this.cueTipPadding;
+        const distance = minimumDistance + this.cuePullback;
+        this.cueStick
+            .setPosition(
+                cueBall.image.x - Math.cos(this.cueAngle) * distance,
+                cueBall.image.y - Math.sin(this.cueAngle) * distance
+            )
+            .setRotation(this.cueAngle);
+        this.renderTrajectoryGuide();
+    }
+
+    getTrajectoryDistance(cueBall, directionX, directionY) {
+        const bounds = this.getTableBounds();
+        const radius = this.ballRadius;
+        const minX = bounds.left + radius;
+        const maxX = bounds.right - radius;
+        const minY = bounds.top + radius;
+        const maxY = bounds.bottom - radius;
+        const wallDistanceX = directionX > 0
+            ? (maxX - cueBall.x) / directionX
+            : directionX < 0
+                ? (minX - cueBall.x) / directionX
+                : Number.POSITIVE_INFINITY;
+        const wallDistanceY = directionY > 0
+            ? (maxY - cueBall.y) / directionY
+            : directionY < 0
+                ? (minY - cueBall.y) / directionY
+                : Number.POSITIVE_INFINITY;
+        let nearestDistance = Math.min(wallDistanceX, wallDistanceY);
+        let targetBall = null;
+        const collisionRadius = this.ballRadius * 2 * 0.935;
+        const collisionRadiusSquared = collisionRadius * collisionRadius;
+
+        for (const ballState of this.balls) {
+            if (
+                ballState.type.index === 0
+                || ballState.pocketed
+                || ballState.pocketing
+                || !ballState.image
+            ) continue;
+
+            const offsetX = ballState.image.x - cueBall.x;
+            const offsetY = ballState.image.y - cueBall.y;
+            const projectedDistance = offsetX * directionX + offsetY * directionY;
+            if (projectedDistance <= 0) continue;
+
+            const perpendicularDistanceSquared = offsetX * offsetX
+                + offsetY * offsetY
+                - projectedDistance * projectedDistance;
+            if (perpendicularDistanceSquared > collisionRadiusSquared) continue;
+
+            const entryDistance = projectedDistance - Math.sqrt(
+                collisionRadiusSquared - perpendicularDistanceSquared
             );
-
-            if (clickedBall) {
-                this.selectedBall = clickedBall;
-                return;
+            if (entryDistance >= 0 && entryDistance < nearestDistance) {
+                nearestDistance = entryDistance;
+                targetBall = ballState;
             }
+        }
 
-            if (!this.selectedBall?.image) return;
-            const selectedImage = this.selectedBall.image;
-            const direction = new Phaser.Math.Vector2(
-                pointer.worldX - selectedImage.x,
-                pointer.worldY - selectedImage.y
+        return {
+            distance: Math.max(radius, nearestDistance),
+            targetBall
+        };
+    }
+
+    getTargetTrajectoryDistance(targetBall, directionX, directionY) {
+        const bounds = this.getTableBounds();
+        const radius = this.ballRadius;
+        const minX = bounds.left + radius;
+        const maxX = bounds.right - radius;
+        const minY = bounds.top + radius;
+        const maxY = bounds.bottom - radius;
+        const wallDistanceX = directionX > 0
+            ? (maxX - targetBall.image.x) / directionX
+            : directionX < 0
+                ? (minX - targetBall.image.x) / directionX
+                : Number.POSITIVE_INFINITY;
+        const wallDistanceY = directionY > 0
+            ? (maxY - targetBall.image.y) / directionY
+            : directionY < 0
+                ? (minY - targetBall.image.y) / directionY
+                : Number.POSITIVE_INFINITY;
+        const wallDistance = Math.min(wallDistanceX, wallDistanceY);
+        let obstacleDistance = Number.POSITIVE_INFINITY;
+        const collisionRadius = radius * 2 * 0.935;
+        const collisionRadiusSquared = collisionRadius * collisionRadius;
+
+        for (const ballState of this.balls) {
+            if (
+                ballState.type.index === 0
+                || ballState === targetBall
+                || ballState.pocketed
+                || ballState.pocketing
+                || !ballState.image
+            ) continue;
+
+            const offsetX = ballState.image.x - targetBall.image.x;
+            const offsetY = ballState.image.y - targetBall.image.y;
+            const projectedDistance = offsetX * directionX + offsetY * directionY;
+            if (projectedDistance <= 0) continue;
+            const perpendicularDistanceSquared = offsetX * offsetX
+                + offsetY * offsetY
+                - projectedDistance * projectedDistance;
+            if (perpendicularDistanceSquared > collisionRadiusSquared) continue;
+
+            const entryDistance = projectedDistance - Math.sqrt(
+                collisionRadiusSquared - perpendicularDistanceSquared
             );
+            if (entryDistance >= 0) {
+                obstacleDistance = Math.min(obstacleDistance, entryDistance);
+            }
+        }
 
-            if (direction.lengthSq() > 0) {
-                direction.normalize().scale(430);
-                selectedImage.setVelocity(direction.x, direction.y);
+        let endDistance = Math.min(wallDistance, obstacleDistance);
+        let pocketDistance = Number.POSITIVE_INFINITY;
+        for (const hole of this.holes) {
+            const offsetX = hole.x - targetBall.image.x;
+            const offsetY = hole.y - targetBall.image.y;
+            const projectedDistance = offsetX * directionX + offsetY * directionY;
+            if (projectedDistance <= 0 || projectedDistance >= obstacleDistance) continue;
+
+            const perpendicularDistanceSquared = offsetX * offsetX
+                + offsetY * offsetY
+                - projectedDistance * projectedDistance;
+            const captureWidth = Math.max(radius, hole.radius * 0.72);
+            if (
+                perpendicularDistanceSquared <= captureWidth * captureWidth
+                && projectedDistance <= wallDistance + hole.radius * 1.5
+            ) {
+                pocketDistance = Math.min(pocketDistance, projectedDistance);
+            }
+        }
+        if (Number.isFinite(pocketDistance)) endDistance = pocketDistance;
+
+        return Math.max(radius, endDistance);
+    }
+
+    renderTrajectoryGuide() {
+        const cueBall = this.getCueBall();
+        const guide = this.trajectoryGuide;
+        guide.clear();
+        if (
+            !cueBall?.image
+            || (this.cueState !== "aiming" && this.cueState !== "pulling")
+        ) {
+            guide.setVisible(false);
+            return;
+        }
+
+        const directionX = Math.cos(this.cueAngle);
+        const directionY = Math.sin(this.cueAngle);
+        const trajectory = this.getTrajectoryDistance(
+            cueBall.image,
+            directionX,
+            directionY
+        );
+        const endDistance = trajectory.distance;
+        const startDistance = this.ballRadius + 7;
+        const dotSpacing = 14;
+
+        guide.fillStyle(0xffffff, 0.82);
+        for (
+            let distance = startDistance;
+            distance < endDistance - 3;
+            distance += dotSpacing
+        ) {
+            guide.fillCircle(
+                cueBall.image.x + directionX * distance,
+                cueBall.image.y + directionY * distance,
+                2.2
+            );
+        }
+
+        if (trajectory.targetBall?.image) {
+            const impactX = cueBall.image.x + directionX * endDistance;
+            const impactY = cueBall.image.y + directionY * endDistance;
+            const targetDirection = new Phaser.Math.Vector2(
+                trajectory.targetBall.image.x - impactX,
+                trajectory.targetBall.image.y - impactY
+            );
+            if (targetDirection.lengthSq() > 0) {
+                targetDirection.normalize();
+                const targetDistance = this.getTargetTrajectoryDistance(
+                    trajectory.targetBall,
+                    targetDirection.x,
+                    targetDirection.y
+                );
+                guide.fillStyle(0x78e7ff, 0.9);
+                for (
+                    let distance = startDistance;
+                    distance < targetDistance - 3;
+                    distance += dotSpacing
+                ) {
+                    guide.fillCircle(
+                        trajectory.targetBall.image.x + targetDirection.x * distance,
+                        trajectory.targetBall.image.y + targetDirection.y * distance,
+                        2.35
+                    );
+                }
+            }
+        }
+        guide.setVisible(true);
+    }
+
+    beginCuePullback(pointer) {
+        if (
+            this.currentTurn !== "player"
+            || this.gameOver
+            || this.cueState !== "aiming"
+            || !this.areBallsStopped()
+        ) return;
+
+        this.updateCueAngle(pointer);
+        this.cueState = "pulling";
+        this.pullStart = { x: pointer.worldX, y: pointer.worldY };
+        this.cuePullback = 0;
+        this.shotPower = 0;
+    }
+
+    updateCuePullback(pointer) {
+        if (this.cueState !== "pulling") return;
+
+        const dragX = pointer.worldX - this.pullStart.x;
+        const dragY = pointer.worldY - this.pullStart.y;
+        const directionX = Math.cos(this.cueAngle);
+        const directionY = Math.sin(this.cueAngle);
+        const backwardDistance = -(dragX * directionX + dragY * directionY);
+
+        this.cuePullback = Phaser.Math.Clamp(
+            backwardDistance,
+            0,
+            this.maxCuePullback
+        );
+        this.shotPower = this.cuePullback / this.maxCuePullback;
+        this.renderCueStick();
+    }
+
+    releaseCue() {
+        if (
+            this.currentTurn !== "player"
+            || this.gameOver
+            || this.cueState !== "pulling"
+        ) return;
+        if (this.shotPower <= 0) {
+            this.cueState = "aiming";
+            return;
+        }
+
+        const angle = this.cueAngle;
+        const power = this.shotPower;
+        this.beginTrackedShot();
+        this.strikeCue(angle, power);
+    }
+
+    strikeCue(angle, power) {
+        this.cueState = "striking";
+        this.trajectoryGuide.clear().setVisible(false);
+        this.cueStrikeTween = this.tweens.add({
+            targets: this,
+            // Travel through the aiming padding so the tip reaches the ball.
+            cuePullback: -this.cueTipPadding,
+            duration: 90,
+            ease: "Quad.easeIn",
+            onUpdate: () => this.renderCueStick(),
+            onComplete: () => {
+                this.cueStrikeTween = null;
+                this.cueStick.setVisible(false);
+                this.cueState = "hidden";
+                this.cuePullback = 0;
+                this.shotPower = 0;
+
+                const cueBall = this.getCueBall();
+                if (!cueBall?.image) return;
+                cueBall.image.setVelocity(
+                    Math.cos(angle) * power * this.maxShotSpeed,
+                    Math.sin(angle) * power * this.maxShotSpeed
+                );
             }
         });
     }
 
+    resetCueStick() {
+        if (this.cueStrikeTween) {
+            this.cueStrikeTween.stop();
+            this.cueStrikeTween = null;
+        }
+        this.cuePullback = 0;
+        this.shotPower = 0;
+        this.cueState = "hidden";
+        this.cueStick?.setVisible(false);
+        this.trajectoryGuide?.clear().setVisible(false);
+    }
+
+    isPathClear(start, end, ignoredIndexes) {
+        const segmentX = end.x - start.x;
+        const segmentY = end.y - start.y;
+        const segmentLengthSquared = segmentX * segmentX + segmentY * segmentY;
+        if (segmentLengthSquared === 0) return false;
+        const clearance = this.ballRadius * 1.9;
+
+        return this.balls.every(ballState => {
+            if (
+                ignoredIndexes.includes(ballState.type.index)
+                || ballState.pocketed
+                || ballState.pocketing
+                || !ballState.image
+            ) return true;
+
+            const projection = Phaser.Math.Clamp((
+                (ballState.image.x - start.x) * segmentX
+                + (ballState.image.y - start.y) * segmentY
+            ) / segmentLengthSquared, 0, 1);
+            const nearestX = start.x + segmentX * projection;
+            const nearestY = start.y + segmentY * projection;
+            return Phaser.Math.Distance.Squared(
+                nearestX,
+                nearestY,
+                ballState.image.x,
+                ballState.image.y
+            ) > clearance * clearance;
+        });
+    }
+
+    chooseComputerShot() {
+        const cueBall = this.getCueBall()?.image;
+        if (!cueBall) return null;
+
+        const computer = this.players.computer;
+        const targetGroup = computer.group;
+        let targets = this.balls.filter(ballState => {
+            if (ballState.pocketed || ballState.pocketing || !ballState.image) return false;
+            if (!targetGroup) return this.getBallGroup(ballState.type.index) !== null;
+            if (computer.score >= 7) return ballState.type.index === 8;
+            return this.getBallGroup(ballState.type.index) === targetGroup;
+        });
+
+        if (targets.length === 0) {
+            targets = this.balls.filter(ballState =>
+                ballState.type.index === 8 && !ballState.pocketed && ballState.image
+            );
+        }
+
+        let bestShot = null;
+        for (const target of targets) {
+            for (const hole of this.holes) {
+                const pocketVector = new Phaser.Math.Vector2(
+                    hole.x - target.image.x,
+                    hole.y - target.image.y
+                );
+                const targetToHoleDistance = pocketVector.length();
+                if (targetToHoleDistance === 0) continue;
+                pocketVector.normalize();
+
+                const ghostBall = {
+                    x: target.image.x - pocketVector.x * this.ballRadius * 2,
+                    y: target.image.y - pocketVector.y * this.ballRadius * 2
+                };
+                if (!this.isPathClear(cueBall, ghostBall, [0, target.type.index])) continue;
+                if (!this.isPathClear(
+                    target.image,
+                    { x: hole.x, y: hole.y },
+                    [0, target.type.index]
+                )) continue;
+
+                const cueToGhostDistance = Phaser.Math.Distance.Between(
+                    cueBall.x,
+                    cueBall.y,
+                    ghostBall.x,
+                    ghostBall.y
+                );
+                const score = cueToGhostDistance + targetToHoleDistance * 0.7;
+                if (!bestShot || score < bestShot.score) {
+                    bestShot = { target, hole, ghostBall, score };
+                }
+            }
+        }
+
+        if (!bestShot && targets.length > 0) {
+            const target = targets.reduce((nearest, candidate) =>
+                Phaser.Math.Distance.Squared(cueBall.x, cueBall.y, candidate.image.x, candidate.image.y)
+                    < Phaser.Math.Distance.Squared(cueBall.x, cueBall.y, nearest.image.x, nearest.image.y)
+                    ? candidate
+                    : nearest
+            );
+            bestShot = {
+                target,
+                ghostBall: { x: target.image.x, y: target.image.y },
+                score: Phaser.Math.Distance.Between(
+                    cueBall.x,
+                    cueBall.y,
+                    target.image.x,
+                    target.image.y
+                )
+            };
+        }
+
+        if (!bestShot) return null;
+        const angle = Math.atan2(
+            bestShot.ghostBall.y - cueBall.y,
+            bestShot.ghostBall.x - cueBall.x
+        ) + Phaser.Math.FloatBetween(-0.012, 0.012);
+        const power = Phaser.Math.Clamp(0.5 + bestShot.score / 1800, 0.5, 0.92);
+        return { angle, power };
+    }
+
+    scheduleComputerShot() {
+        if (this.aiShotTimer || this.gameOver || this.currentTurn !== "computer") return;
+        this.aiShotTimer = this.time.delayedCall(650, () => {
+            this.aiShotTimer = null;
+            this.executeComputerShot();
+        });
+    }
+
+    executeComputerShot() {
+        if (
+            this.gameOver
+            || this.currentTurn !== "computer"
+            || this.shotInProgress
+            || !this.areBallsStopped()
+        ) return;
+
+        const shot = this.chooseComputerShot();
+        if (!shot) return;
+        this.cueAngle = shot.angle;
+        this.shotPower = shot.power;
+        this.cuePullback = shot.power * this.maxCuePullback;
+        this.cueState = "pulling";
+        this.cueStick.setVisible(true);
+        this.renderCueStick();
+
+        this.aiShotTimer = this.time.delayedCall(450, () => {
+            this.aiShotTimer = null;
+            if (this.gameOver || this.currentTurn !== "computer") return;
+            this.beginTrackedShot();
+            this.strikeCue(shot.angle, shot.power);
+        });
+    }
+
+    createControls() {
+        this.keys = this.input.keyboard.addKeys({
+            R: Phaser.Input.Keyboard.KeyCodes.R
+        });
+
+        this.input.on("pointerdown", pointer => {
+            if (this.isScratchSequence || !pointer.leftButtonDown()) return;
+            this.beginCuePullback(pointer);
+        });
+        this.input.on("pointermove", pointer => {
+            if (this.currentTurn !== "player" || this.gameOver) return;
+            if (this.cueState === "pulling") {
+                this.updateCuePullback(pointer);
+            } else {
+                this.updateCueAngle(pointer);
+            }
+        });
+        this.input.on("pointerup", pointer => {
+            if (pointer.button === 0) this.releaseCue();
+        });
+    }
+
     createHud() {
-        this.title = this.add.text(34, 30, "BILLIARD BALL RACK", {
-            fontFamily: "Arial",
-            fontSize: "24px",
+
+
+        this.playerScoreText = this.add.text(this.scale.width * .15, 10, "", {
+            fontFamily: "monospace",
+            fontSize: "18px",
             fontStyle: "bold",
             color: "#ffffff",
             stroke: "#14202a",
-            strokeThickness: 5
+            strokeThickness: 4
         }).setDepth(10);
 
-        this.instructions = this.add.text(
-            34,
-            64,
-            "Click a ball: select  •  Click empty space: launch  •  WASD/arrows: push  •  R: reset",
+        this.computerScoreText = this.add.text(
+            this.scale.width * .85,
+            10,
+            "",
             {
-                fontFamily: "Arial",
-                fontSize: "15px",
-                color: "#d6e8f2",
+                fontFamily: "monospace",
+                fontSize: "18px",
+                fontStyle: "bold",
+                color: "#ffffff",
                 stroke: "#14202a",
                 strokeThickness: 4
             }
-        ).setDepth(10);
+        ).setOrigin(1, 0).setDepth(10);
 
-        this.speedText = this.add.text(34, 91, "", {
-            fontFamily: "monospace",
-            fontSize: "15px",
-            color: "#ffda83",
-            stroke: "#14202a",
-            strokeThickness: 4
-        }).setDepth(10);
 
-        this.scoreText = this.add.text(34, 118, "Score: 0", {
-            fontFamily: "monospace",
-            fontSize: "17px",
-            fontStyle: "bold",
-            color: "#ffffff",
-            stroke: "#14202a",
-            strokeThickness: 4
-        }).setDepth(10);
+
+        this.scratchText = this.add.text(
+            this.scale.width / 2,
+            this.scale.height / 2,
+            "SCRATCH",
+            {
+                fontFamily: "Arial Black, Arial, sans-serif",
+                fontSize: "96px",
+                fontStyle: "bold",
+                color: "#ff2020",
+                stroke: "#ffffff",
+                strokeThickness: 8
+            }
+        )
+            .setOrigin(0.5)
+            .setDepth(100)
+            .setVisible(false)
+            .setAlpha(0);
+
+        this.updateScoreHud();
+    }
+
+    updateScoreHud() {
+        if (!this.playerScoreText || !this.computerScoreText) return;
+        const groupLabel = player => player.group
+            ? `${player.group.toUpperCase()}S`
+            : "OPEN";
+        const playerTurn = this.currentTurn === "player" && !this.gameOver
+            ? "▶ "
+            : "";
+        const computerTurn = this.currentTurn === "computer" && !this.gameOver
+            ? "▶ "
+            : "";
+        this.playerScoreText.setText(
+            `${playerTurn}PLAYER  ${this.players.player.score}/7  ${groupLabel(this.players.player)}`
+        );
+        this.computerScoreText.setText(
+            `${computerTurn}COMPUTER  ${this.players.computer.score}/7  ${groupLabel(this.players.computer)}`
+        );
     }
 
     update(time, delta) {
         const dt = delta / 1000;
 
-        if (Phaser.Input.Keyboard.JustDown(this.keys.R)) {
+        if (
+            Phaser.Input.Keyboard.JustDown(this.keys.R)
+            && (!this.gameOver || this.gameOverPhase === "restart")
+        ) {
             this.resetBalls();
         }
 
+        if (this.gameOver) {
+            return;
+        }
+
         this.checkHoleCollisions();
+        if (this.isScratchSequence) {
+            this.scratchText.setText("Game over");
+            return;
+        }
         if (this.rerackPending) {
             this.rerackObjectBalls();
         }
 
-        if (!this.selectedBall?.image) {
-            this.selectedBall = this.balls.find(ballState => !ballState.pocketed)
-                || null;
-        }
-        if (!this.selectedBall) {
-            this.speedText.setText("No balls remaining");
+        const cueBall = this.getCueBall();
+        if (!cueBall?.image) {
             return;
         }
 
-        const selectedImage = this.selectedBall.image;
-        const body = selectedImage.body;
-
-        let inputX = 0;
-        let inputY = 0;
-
-        if (this.cursors.left.isDown || this.keys.A.isDown) inputX -= 1;
-        if (this.cursors.right.isDown || this.keys.D.isDown) inputX += 1;
-        if (this.cursors.up.isDown || this.keys.W.isDown) inputY -= 1;
-        if (this.cursors.down.isDown || this.keys.S.isDown) inputY += 1;
-
-        const input = new Phaser.Math.Vector2(inputX, inputY);
-
-        if (input.lengthSq() > 0) {
-            input.normalize();
-            selectedImage.setAcceleration(
-                input.x * this.acceleration,
-                input.y * this.acceleration
-            );
-            selectedImage.setDrag(this.drag * 0.35, this.drag * 0.35);
-        } else {
-            selectedImage.setAcceleration(0, 0);
-            selectedImage.setDrag(this.drag, this.drag);
-        }
-
-        if (this.keys.SPACE.isDown) {
-            selectedImage.setAcceleration(0, 0);
-            selectedImage.setDrag(1500, 1500);
-        }
-
         this.balls.forEach(ballState => {
-            if (ballState.pocketed || !ballState.image) return;
+            if (ballState.pocketed || ballState.pocketing || !ballState.image) return;
+            this.applyTableFriction(ballState, dt);
             const velocity = ballState.image.body.velocity;
             const speed = velocity.length();
 
@@ -992,12 +1791,48 @@ export class GameScene extends Phaser.Scene {
             ballState.shine.setPosition(ballState.image.x, ballState.image.y);
         });
 
-        const velocity = body.velocity;
+        const velocity = cueBall.image.body.velocity;
         const speed = velocity.length();
+        const ballsStopped = this.areBallsStopped();
 
-        this.speedText.setText(
-            `Selected: ${this.selectedBall.type.index}   Speed: ${speed.toFixed(0)} px/s`
-        );
+        if (
+            this.shotInProgress
+            && this.cueState === "hidden"
+            && ballsStopped
+        ) {
+            this.resolveCompletedShot();
+            if (this.gameOver) return;
+        }
+
+        if (
+            !this.shotInProgress
+            && this.currentTurn === "player"
+            && this.cueState === "hidden"
+            && ballsStopped
+        ) {
+            this.cueState = "aiming";
+            this.cueStick.setVisible(true);
+            this.updateCueAngle();
+        } else if (this.cueState === "aiming" && !ballsStopped) {
+            this.resetCueStick();
+        }
+
+        if (
+            !this.shotInProgress
+            && this.currentTurn === "computer"
+            && ballsStopped
+        ) {
+            if (this.cueState === "aiming") this.resetCueStick();
+            this.scheduleComputerShot();
+        }
+
+        if (this.cueState === "aiming" && this.currentTurn === "player") {
+            this.updateCueAngle();
+        }
+        if (this.cueState === "aiming" || this.cueState === "pulling") {
+            this.renderCueStick();
+        }
+
     }
 
     resize(gameSize) {
@@ -1006,13 +1841,24 @@ export class GameScene extends Phaser.Scene {
 
         this.floor.setPosition(width / 2, height / 2);
         this.floor.setDisplaySize(width, height);
+        this.title?.setPosition(width / 2, 30);
+        this.computerScoreText?.setPosition(width - 34, 28);
+        this.layoutCueStick();
+        this.scratchText?.setPosition(width / 2, height / 2);
+        if (this.gameOver && this.scratchText) {
+            const fontScale = this.gameOverPhase === "restart" ? 0.045 : 0.063;
+            const maxSize = this.gameOverPhase === "restart" ? 64 : 96;
+            this.scratchText.setFontSize(
+                Phaser.Math.Clamp(width * fontScale, 32, maxSize)
+            );
+        }
         this.layoutTableHoles(width, height);
         this.drawTableSpots();
         this.updateWorldBounds(width, height);
 
         const bounds = this.getTableBounds(width, height);
         this.balls.forEach(ballState => {
-            if (!ballState.image?.body) return;
+            if (ballState.pocketing || !ballState.image?.body) return;
 
             ballState.image.body.setBoundsRectangle(bounds);
             this.constrainBallToScreen(ballState, width, height);
