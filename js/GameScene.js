@@ -5,7 +5,7 @@ export class GameScene extends Phaser.Scene {
 
         this.ballRadius = 16;
         this.acceleration = 900;
-        this.maxSpeed = 1050;
+        this.maxSpeed = 1550;
         this.tableFriction = .8;
         this.ballStopSpeed = 5;
         this.restitution = 0.82;
