@@ -41,6 +41,8 @@ export class GameScene extends Phaser.Scene {
         this.aiShotTimer = null;
         this.gameOverPhase = null;
         this.gameOverTimers = [];
+        this.activeShotPointerId = null;
+        this.tableBounds = null;
     }
 
     preload() {
@@ -390,6 +392,7 @@ export class GameScene extends Phaser.Scene {
         const height = this.scale.height;
 
         this.updateWorldBounds(width, height);
+        this.tableBounds = this.getTableBounds(width, height);
 
         this.floor = this.add.image(
             width / 2,
@@ -960,6 +963,7 @@ export class GameScene extends Phaser.Scene {
 
     resetBalls() {
         this.resetCueStick();
+        this.activeShotPointerId = null;
         this.gameOverTimers.forEach(timer => timer.remove(false));
         this.gameOverTimers = [];
         this.gameOverPhase = null;
@@ -1122,7 +1126,8 @@ export class GameScene extends Phaser.Scene {
         const restartTimer = this.time.delayedCall(10000, () => {
             this.gameOverPhase = "restart";
             this.scratchText
-                .setText("PRESS R TO RE-RACK")
+                .setText("CLICK / SPACE\nTO RE-RACK")
+                .setAlign("center")
                 .setFontSize(Phaser.Math.Clamp(this.scale.width * 0.045, 32, 64));
         });
         this.gameOverTimers = [gameOverTimer, restartTimer];
@@ -1399,13 +1404,14 @@ export class GameScene extends Phaser.Scene {
             || this.gameOver
             || this.cueState !== "aiming"
             || !this.areBallsStopped()
-        ) return;
+        ) return false;
 
         this.updateCueAngle(pointer);
         this.cueState = "pulling";
         this.pullStart = { x: pointer.worldX, y: pointer.worldY };
         this.cuePullback = 0;
         this.shotPower = 0;
+        return true;
     }
 
     updateCuePullback(pointer) {
@@ -1629,15 +1635,31 @@ export class GameScene extends Phaser.Scene {
 
     createControls() {
         this.keys = this.input.keyboard.addKeys({
-            R: Phaser.Input.Keyboard.KeyCodes.R
+            R: Phaser.Input.Keyboard.KeyCodes.R,
+            SPACE: Phaser.Input.Keyboard.KeyCodes.SPACE
         });
 
         this.input.on("pointerdown", pointer => {
-            if (this.isScratchSequence || !pointer.leftButtonDown()) return;
-            this.beginCuePullback(pointer);
+            const isPrimaryPointer = pointer.wasTouch || pointer.leftButtonDown();
+            if (this.gameOverPhase === "restart" && isPrimaryPointer) {
+                this.resetBalls();
+                return;
+            }
+            if (
+                this.isScratchSequence
+                || this.activeShotPointerId !== null
+                || !isPrimaryPointer
+            ) return;
+            if (this.beginCuePullback(pointer)) {
+                this.activeShotPointerId = pointer.id;
+            }
         });
         this.input.on("pointermove", pointer => {
             if (this.currentTurn !== "player" || this.gameOver) return;
+            if (
+                this.activeShotPointerId !== null
+                && pointer.id !== this.activeShotPointerId
+            ) return;
             if (this.cueState === "pulling") {
                 this.updateCuePullback(pointer);
             } else {
@@ -1645,7 +1667,9 @@ export class GameScene extends Phaser.Scene {
             }
         });
         this.input.on("pointerup", pointer => {
-            if (pointer.button === 0) this.releaseCue();
+            if (pointer.id !== this.activeShotPointerId) return;
+            this.activeShotPointerId = null;
+            this.releaseCue();
         });
     }
 
@@ -1715,13 +1739,34 @@ export class GameScene extends Phaser.Scene {
         this.computerScoreText.setText(
             `${computerTurn}COMPUTER  ${this.players.computer.score}/7  ${groupLabel(this.players.computer)}`
         );
+        this.layoutHud(this.scale.width, this.scale.height);
+    }
+
+    layoutHud(width, height) {
+        if (!this.playerScoreText || !this.computerScoreText) return;
+
+        const isNarrow = width < 620;
+        const fontSize = isNarrow
+            ? Phaser.Math.Clamp(width * 0.034, 10, 15)
+            : Phaser.Math.Clamp(width * 0.014, 16, 20);
+        const sideInset = isNarrow ? 10 : Math.max(24, width * 0.022);
+        const topInset = Math.max(8, height * 0.018);
+
+        this.playerScoreText
+            .setFontSize(fontSize)
+            .setPosition(sideInset, topInset);
+        this.computerScoreText
+            .setFontSize(fontSize)
+            .setPosition(width - sideInset, topInset);
     }
 
     update(time, delta) {
         const dt = delta / 1000;
+        const rerackKeyPressed = Phaser.Input.Keyboard.JustDown(this.keys.R)
+            || Phaser.Input.Keyboard.JustDown(this.keys.SPACE);
 
         if (
-            Phaser.Input.Keyboard.JustDown(this.keys.R)
+            rerackKeyPressed
             && (!this.gameOver || this.gameOverPhase === "restart")
         ) {
             this.resetBalls();
@@ -1838,11 +1883,14 @@ export class GameScene extends Phaser.Scene {
     resize(gameSize) {
         const width = gameSize.width;
         const height = gameSize.height;
+        if (!width || !height) return;
+
+        const previousBounds = this.tableBounds;
+        const nextBounds = this.getTableBounds(width, height);
 
         this.floor.setPosition(width / 2, height / 2);
         this.floor.setDisplaySize(width, height);
-        this.title?.setPosition(width / 2, 30);
-        this.computerScoreText?.setPosition(width - 34, 28);
+        this.layoutHud(width, height);
         this.layoutCueStick();
         this.scratchText?.setPosition(width / 2, height / 2);
         if (this.gameOver && this.scratchText) {
@@ -1856,12 +1904,24 @@ export class GameScene extends Phaser.Scene {
         this.drawTableSpots();
         this.updateWorldBounds(width, height);
 
-        const bounds = this.getTableBounds(width, height);
+        const bounds = nextBounds;
         this.balls.forEach(ballState => {
             if (ballState.pocketing || !ballState.image?.body) return;
 
+            if (previousBounds?.width > 0 && previousBounds?.height > 0) {
+                ballState.image.setPosition(
+                    ballState.image.x + bounds.centerX - previousBounds.centerX,
+                    ballState.image.y + bounds.centerY - previousBounds.centerY
+                );
+                ballState.shadow?.setPosition(ballState.image.x, ballState.image.y);
+                ballState.shine?.setPosition(ballState.image.x, ballState.image.y);
+            }
+
             ballState.image.body.setBoundsRectangle(bounds);
+            ballState.image.body.updateFromGameObject();
             this.constrainBallToScreen(ballState, width, height);
         });
+        this.tableBounds = bounds;
+        this.renderCueStick();
     }
 }

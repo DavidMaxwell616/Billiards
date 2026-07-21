@@ -118,6 +118,7 @@ export class SplashScene extends Phaser.Scene {
     resize(gameSize) {
         const width = gameSize.width;
         const height = gameSize.height;
+        const isNarrow = width < 600;
         const source = this.background.texture.getSourceImage();
         const coverScale = Math.max(width / source.width, height / source.height);
 
@@ -129,12 +130,16 @@ export class SplashScene extends Phaser.Scene {
             .setSize(width, height);
         this.title
             .setPosition(width / 2, height * 0.13)
-            .setFontSize(Phaser.Math.Clamp(width * 0.047, 42, 76));
+            .setFontSize(Phaser.Math.Clamp(width * (isNarrow ? 0.105 : 0.047), 34, 76));
         this.subtitle
             .setPosition(width / 2, height * 0.23)
-            .setFontSize(Phaser.Math.Clamp(width * 0.016, 15, 26));
+            .setFontSize(Phaser.Math.Clamp(width * (isNarrow ? 0.041 : 0.016), 12, 26))
+            .setLetterSpacing(isNarrow ? 3 : 7);
         this.startButton
             .setPosition(width / 2, height * 0.86)
-            .setFontSize(Phaser.Math.Clamp(width * 0.016, 17, 25));
+            .setFontSize(Phaser.Math.Clamp(width * (isNarrow ? 0.046 : 0.016), 14, 25))
+            .setPadding(
+                isNarrow ? { x: 18, y: 13 } : { x: 30, y: 15 }
+            );
     }
 }
